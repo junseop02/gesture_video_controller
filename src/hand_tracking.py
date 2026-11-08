@@ -1,15 +1,17 @@
-import cv2
-import mediapipe as mp
+
+import time
 from pathlib import Path
 
+import cv2
+import mediapipe as mp
+
 from gesture_recognition import (
-    recognize_hand_shape,
-    JamJamRecognizer
+    GestureController,
+    recognize_gesture,
+    gun_diagnostics
 )
-from motion_tracking import MotionTracker
 
 
-# 프로젝트 경로
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODEL_PATH = BASE_DIR / "models" / "hand_landmarker.task"
 
@@ -19,13 +21,13 @@ if not MODEL_PATH.is_file():
     )
 
 
-# MediaPipe 설정
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
+RunningMode = mp.tasks.vision.RunningMode
 
-HAND_CONNECTIONS = [
+
+CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
     (5, 9), (9, 10), (10, 11), (11, 12),
@@ -34,223 +36,309 @@ HAND_CONNECTIONS = [
     (0, 17)
 ]
 
-options = HandLandmarkerOptions(
-    base_options=BaseOptions(
-        model_asset_path=str(MODEL_PATH)
-    ),
-    running_mode=VisionRunningMode.VIDEO,
-    num_hands=2
-)
+
+def draw_landmarks(frame, landmarks):
+    height, width = frame.shape[:2]
+    points = []
+
+    for lm in landmarks:
+        x = int(lm.x * width)
+        y = int(lm.y * height)
+
+        points.append((x, y))
+
+        cv2.circle(
+            frame,
+            (x, y),
+            4,
+            (0, 0, 255),
+            -1
+        )
+
+    for start, end in CONNECTIONS:
+        cv2.line(
+            frame,
+            points[start],
+            points[end],
+            (0, 255, 0),
+            2
+        )
 
 
-# 제스처 인식기
-motion_tracker = MotionTracker()
-jamjam_recognizer = JamJamRecognizer()
+def get_handedness(result, index):
+    if (
+        index >= len(result.handedness)
+        or not result.handedness[index]
+    ):
+        return "UNKNOWN"
+
+    detected_hand = (
+        result.handedness[index][0].category_name
+    )
+
+    # 기존 카메라 환경에 맞춘 좌우 보정 유지
+    if detected_hand == "Left":
+        return "Right"
+
+    if detected_hand == "Right":
+        return "Left"
+
+    return "UNKNOWN"
 
 
-def reset_recognizers():
-    motion_tracker.reset()
-    jamjam_recognizer.reset()
+def status_text(value):
+    return "OK" if value else "NO"
 
 
-# 웹캠 연결
-cap = cv2.VideoCapture(0)
+def draw_debug(frame, hand_name, info, row):
+    x = 15
+    y = 220 + row * 150
 
-if not cap.isOpened():
-    raise RuntimeError("웹캠을 열 수 없습니다.")
+    angle_value = info["index_angle"]
+
+    if angle_value is None:
+        angle_text = "N/A"
+    else:
+        angle_text = f"{angle_value:.1f}"
+
+    lines = [
+        f"{hand_name} GUN TEST",
+        (
+            f"Shape: {status_text(info['shape_ok'])}  "
+            f"Thumb: {status_text(info['thumb_ok'])}"
+        ),
+        (
+            f"Index: {status_text(info['index_ok'])}  "
+            f"Middle: {status_text(info['middle_ok'])}"
+        ),
+        (
+            f"Ring: {status_text(info['ring_ok'])}  "
+            f"Pinky: {status_text(info['pinky_ok'])}"
+        ),
+        (
+            f"Direction: {status_text(info['direction_ok'])} "
+            f"({angle_text} deg)"
+        ),
+        (
+            f"Palm: {status_text(info['palm_ok'])} "
+            f"({info['palm_score']:.2f})"
+        ),
+    ]
+
+    for j, line in enumerate(lines):
+        cv2.putText(
+            frame,
+            line,
+            (x, y + j * 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            2
+        )
 
 
-try:
-    with HandLandmarker.create_from_options(options) as landmarker:
+def main():
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(
+            model_asset_path=str(MODEL_PATH)
+        ),
+        running_mode=RunningMode.VIDEO,
+        num_hands=2
+    )
 
-        timestamp_ms = 0
+    controller = GestureController()
 
-        # 제스처 명령 활성화 상태
-        recognition_enabled = True
+    cap = cv2.VideoCapture(0)
 
-        last_motion = "NONE"
-        last_gesture = "NONE"
-        hand_shape = "NONE"
+    if not cap.isOpened():
+        raise RuntimeError("웹캠을 열 수 없습니다.")
 
-        while True:
-            ret, frame = cap.read()
+    start_time = time.monotonic()
+    last_timestamp = -1
+    last_command = "NONE"
 
-            if not ret:
-                print("프레임을 읽을 수 없습니다.")
-                break
+    try:
+        with HandLandmarker.create_from_options(options) as detector:
+            while True:
+                ret, frame = cap.read()
 
-            # 좌우 반전
-            frame = cv2.flip(frame, 1)
-            height, width = frame.shape[:2]
+                if not ret:
+                    print("프레임을 읽을 수 없습니다.")
+                    break
 
-            # BGR -> RGB
-            rgb = cv2.cvtColor(
-                frame,
-                cv2.COLOR_BGR2RGB
-            )
+                frame = cv2.flip(frame, 1)
 
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=rgb
-            )
+                rgb = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2RGB
+                )
 
-            # 손 검출
-            timestamp_ms += 33
+                mp_image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=rgb
+                )
 
-            result = landmarker.detect_for_video(
-                mp_image,
-                timestamp_ms
-            )
+                timestamp_ms = int(
+                    (time.monotonic() - start_time) * 1000
+                )
 
-            if not result.hand_landmarks:
-                reset_recognizers()
-                hand_shape = "NONE"
+                timestamp_ms = max(
+                    timestamp_ms,
+                    last_timestamp + 1
+                )
 
-            else:
-                # 모든 손의 랜드마크 표시
-                for hand in result.hand_landmarks:
-                    points = []
+                last_timestamp = timestamp_ms
 
-                    for landmark in hand:
-                        x = int(landmark.x * width)
-                        y = int(landmark.y * height)
+                result = detector.detect_for_video(
+                    mp_image,
+                    timestamp_ms
+                )
 
-                        points.append((x, y))
+                detected_gestures = []
 
-                        cv2.circle(
-                            frame,
-                            (x, y),
-                            4,
-                            (0, 0, 255),
-                            -1
+                if result.hand_landmarks:
+                    for i, hand in enumerate(
+                        result.hand_landmarks
+                    ):
+                        draw_landmarks(frame, hand)
+
+                        handedness = get_handedness(
+                            result,
+                            i
                         )
 
-                    for start, end in HAND_CONNECTIONS:
-                        cv2.line(
+                        gesture = recognize_gesture(
+                            hand,
+                            handedness
+                        )
+
+                        detected_gestures.append(
+                            (handedness, gesture)
+                        )
+
+                        info = gun_diagnostics(
+                            hand,
+                            handedness
+                        )
+
+                        draw_debug(
                             frame,
-                            points[start],
-                            points[end],
-                            (0, 255, 0),
+                            handedness,
+                            info,
+                            i
+                        )
+
+                        height, width = frame.shape[:2]
+                        wrist = hand[0]
+
+                        text_x = int(wrist.x * width)
+                        text_y = int(wrist.y * height) + 25
+
+                        text_x = max(
+                            0,
+                            min(text_x, width - 220)
+                        )
+
+                        text_y = max(
+                            25,
+                            min(text_y, height - 10)
+                        )
+
+                        cv2.putText(
+                            frame,
+                            f"{handedness}: {gesture}",
+                            (text_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (255, 255, 0),
                             2
                         )
 
-                # 첫 번째 손 기준
-                hand = result.hand_landmarks[0]
+                    gestures = [
+                        gesture
+                        for _, gesture in detected_gestures
+                    ]
 
-                # 손 모양은 ON/OFF 관계없이 표시
-                hand_shape = recognize_hand_shape(hand)
+                    if "V_SIGN" in gestures:
+                        selected_gesture = "V_SIGN"
 
-                if recognition_enabled:
+                    else:
+                        # 첫 번째 손의 명령을 사용
+                        selected_gesture = gestures[0]
 
-                    # 잼잼 제스처
-                    gesture = jamjam_recognizer.update(
-                        hand_shape
+                    command = controller.update(
+                        selected_gesture
                     )
 
-                    if gesture is not None:
-                        last_gesture = gesture
+                    if command is not None:
+                        last_command = command
+                        print(f"Command: {command}")
 
-                        print(
-                            f"Gesture detected: {gesture}"
-                        )
+                else:
+                    controller.reset_tracking()
 
-                        motion_tracker.reset()
-
-                    # 상하좌우 이동
-                    direction = motion_tracker.update(hand)
-
-                    if direction is not None:
-                        last_motion = direction
-
-                        print(
-                            f"Motion detected: {direction}"
-                        )
-
-            # 인식 ON/OFF 상태
-            status = "ON" if recognition_enabled else "OFF"
-
-            status_color = (
-                (0, 255, 0)
-                if recognition_enabled
-                else (0, 0, 255)
-            )
-
-            cv2.putText(
-                frame,
-                f"Recognition: {status}",
-                (30, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                status_color,
-                2
-            )
-
-            # 손 모양
-            cv2.putText(
-                frame,
-                f"Hand: {hand_shape}",
-                (30, 85),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 0),
-                2
-            )
-
-            # 이동 방향
-            cv2.putText(
-                frame,
-                f"Motion: {last_motion}",
-                (30, 130),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 255),
-                2
-            )
-
-            # 잼잼 인식
-            cv2.putText(
-                frame,
-                f"Gesture: {last_gesture}",
-                (30, 175),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 0, 255),
-                2
-            )
-
-            # 조작 안내
-            cv2.putText(
-                frame,
-                "S: ON/OFF | ESC: EXIT",
-                (30, height - 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2
-            )
-
-            cv2.imshow("Hand Tracking", frame)
-
-            key = cv2.waitKey(1) & 0xFF
-
-            # ESC 종료
-            if key == 27:
-                break
-
-            # S 키로 제스처 명령 ON/OFF
-            elif key in (ord("s"), ord("S")):
-                recognition_enabled = not recognition_enabled
-
-                reset_recognizers()
-
-                last_motion = "NONE"
-                last_gesture = "NONE"
-
-                print(
-                    f"Recognition: "
-                    f"{'ON' if recognition_enabled else 'OFF'}"
+                status = (
+                    "ON" if controller.enabled else "OFF"
                 )
 
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
+                status_color = (
+                    (0, 255, 0)
+                    if controller.enabled
+                    else (0, 0, 255)
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Control: {status}",
+                    (15, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    status_color,
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Hands detected: {len(detected_gestures)}",
+                    (15, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 0),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Last Command: {last_command}",
+                    (15, 115),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 0, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    "ESC: EXIT",
+                    (15, frame.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.imshow(
+                    "Gesture Controller",
+                    frame
+                )
+
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

@@ -2,101 +2,382 @@ import math
 import time
 
 
-def distance(p1, p2):
-    """두 랜드마크 사이의 3차원 거리"""
+GUN_TOLERANCE = 35
+VOLUME_UP_TOLERANCE = 30
+VOLUME_DOWN_TOLERANCE = 35
+
+PALM_SIGN = 1
+PALM_MIN_FACING = 0.25
+
+# 진단 단계에서는 손바닥 방향을 SEEK 필수 조건에서 제외
+REQUIRE_PALM_FOR_GUN = False
+
+
+def distance(a, b):
     return math.sqrt(
-        (p1.x - p2.x) ** 2
-        + (p1.y - p2.y) ** 2
-        + (p1.z - p2.z) ** 2
+        (a.x - b.x) ** 2
+        + (a.y - b.y) ** 2
+        + (a.z - b.z) ** 2
     )
 
 
-def recognize_hand_shape(landmarks):
-    """손 모양을 OPEN, FIST, UNKNOWN으로 분류"""
+def angle(a, b, c):
+    ab = (a.x - b.x, a.y - b.y, a.z - b.z)
+    cb = (c.x - b.x, c.y - b.y, c.z - b.z)
 
-    palm_size = distance(landmarks[0], landmarks[9])
+    dot = sum(x * y for x, y in zip(ab, cb))
+    na = math.sqrt(sum(x * x for x in ab))
+    nc = math.sqrt(sum(x * x for x in cb))
 
-    if palm_size < 1e-6:
-        return "UNKNOWN"
+    if na * nc < 1e-8:
+        return 0.0
 
-    fingers = [
-        (5, 6, 8),
-        (9, 10, 12),
-        (13, 14, 16),
-        (17, 18, 20),
-    ]
+    cosine = max(-1.0, min(1.0, dot / (na * nc)))
+    return math.degrees(math.acos(cosine))
 
-    extended_count = 0
-    folded_count = 0
 
-    for mcp, pip, tip in fingers:
-        tip_dist = distance(
-            landmarks[tip], landmarks[mcp]
+def finger_extended(lm, mcp, pip, tip):
+    return angle(lm[mcp], lm[pip], lm[tip]) > 155
+
+
+def finger_folded(lm, mcp, pip, tip):
+    return angle(lm[mcp], lm[pip], lm[tip]) < 125
+
+
+def finger_direction(lm, start, end):
+    dx = lm[end].x - lm[start].x
+    dy = lm[end].y - lm[start].y
+
+    if math.hypot(dx, dy) < 1e-6:
+        return None
+
+    return math.degrees(math.atan2(dx, -dy))
+
+
+def angle_difference(a, b):
+    return abs((a - b + 180) % 360 - 180)
+
+
+def points_direction(lm, start, end, target, tolerance):
+    direction = finger_direction(lm, start, end)
+
+    if direction is None:
+        return False
+
+    return angle_difference(direction, target) <= tolerance
+
+
+def thumb_extended(lm):
+    palm = max(distance(lm[0], lm[9]), 1e-6)
+
+    thumb_tip_to_index = distance(lm[4], lm[5]) / palm
+    thumb_tip_to_pinky = distance(lm[4], lm[17]) / palm
+
+    return (
+        thumb_tip_to_index > 0.55
+        and thumb_tip_to_pinky > 0.65
+    )
+
+
+def palm_facing_score(lm, handedness):
+    if handedness not in ("Left", "Right"):
+        return 0.0
+
+    wrist = lm[0]
+    index = lm[5]
+    pinky = lm[17]
+
+    ax = index.x - wrist.x
+    ay = index.y - wrist.y
+    az = index.z - wrist.z
+
+    bx = pinky.x - wrist.x
+    by = pinky.y - wrist.y
+    bz = pinky.z - wrist.z
+
+    nx = ay * bz - az * by
+    ny = az * bx - ax * bz
+    nz = ax * by - ay * bx
+
+    magnitude = math.sqrt(nx * nx + ny * ny + nz * nz)
+
+    if magnitude < 1e-8:
+        return 0.0
+
+    hand_sign = 1 if handedness == "Left" else -1
+
+    return (nz / magnitude) * hand_sign * PALM_SIGN
+
+
+def is_palm_facing(lm, handedness):
+    return (
+        palm_facing_score(lm, handedness)
+        >= PALM_MIN_FACING
+    )
+
+
+def is_v_sign(lm):
+    index_open = finger_extended(lm, 5, 6, 8)
+    middle_open = finger_extended(lm, 9, 10, 12)
+
+    ring_folded = finger_folded(lm, 13, 14, 16)
+    pinky_folded = finger_folded(lm, 17, 18, 20)
+
+    spread = angle(lm[8], lm[5], lm[12]) > 15
+
+    return (
+        index_open
+        and middle_open
+        and ring_folded
+        and pinky_folded
+        and spread
+    )
+
+
+def is_ok(lm):
+    palm = max(distance(lm[0], lm[9]), 1e-6)
+
+    touching = distance(lm[4], lm[8]) / palm < 0.35
+
+    others_open = all([
+        finger_extended(lm, 9, 10, 12),
+        finger_extended(lm, 13, 14, 16),
+        finger_extended(lm, 17, 18, 20),
+    ])
+
+    return touching and others_open
+
+
+def gun_diagnostics(lm, handedness):
+    index_open = finger_extended(lm, 5, 6, 8)
+
+    middle_folded = finger_folded(lm, 9, 10, 12)
+    ring_folded = finger_folded(lm, 13, 14, 16)
+    pinky_folded = finger_folded(lm, 17, 18, 20)
+
+    thumb_open = thumb_extended(lm)
+
+    shape_ok = (
+        index_open
+        and thumb_open
+        and middle_folded
+        and ring_folded
+        and pinky_folded
+    )
+
+    index_angle = finger_direction(lm, 5, 8)
+
+    # 좌우 어느 쪽이든 수평으로 겨누면 허용
+    direction_ok = False
+
+    if index_angle is not None:
+        direction_ok = (
+            angle_difference(
+                index_angle,
+                90
+            ) <= GUN_TOLERANCE
+            or angle_difference(
+                index_angle,
+                -90
+            ) <= GUN_TOLERANCE
         )
-        pip_dist = distance(
-            landmarks[pip], landmarks[mcp]
-        )
 
-        ratio = tip_dist / max(pip_dist, 1e-6)
+    palm_score = palm_facing_score(
+        lm,
+        handedness
+    )
 
-        if ratio > 1.6:
-            extended_count += 1
-        elif ratio < 1.3:
-            folded_count += 1
+    palm_ok = (
+        palm_score >= PALM_MIN_FACING
+    )
 
-    if extended_count == 4:
-        return "OPEN"
+    return {
+        "shape_ok": shape_ok,
+        "thumb_ok": thumb_open,
+        "index_ok": index_open,
+        "middle_ok": middle_folded,
+        "ring_ok": ring_folded,
+        "pinky_ok": pinky_folded,
+        "direction_ok": direction_ok,
+        "palm_ok": palm_ok,
+        "palm_score": palm_score,
+        "index_angle": index_angle,
+    }
 
-    if folded_count >= 3:
-        return "FIST"
+
+def is_gun(lm, handedness):
+    info = gun_diagnostics(
+        lm,
+        handedness
+    )
+
+    if not info["shape_ok"]:
+        return False
+
+    if not info["direction_ok"]:
+        return False
+
+    if (
+        REQUIRE_PALM_FOR_GUN
+        and not info["palm_ok"]
+    ):
+        return False
+
+    return True
+
+
+def is_index_up(lm):
+    index_open = finger_extended(lm, 5, 6, 8)
+
+    others_folded = all([
+        finger_folded(lm, 9, 10, 12),
+        finger_folded(lm, 13, 14, 16),
+        finger_folded(lm, 17, 18, 20),
+    ])
+
+    pointing_up = points_direction(
+        lm,
+        5,
+        8,
+        0,
+        VOLUME_UP_TOLERANCE
+    )
+
+    # 총 모양과 구분하기 위해 엄지 펼침을 제외
+    return (
+        index_open
+        and others_folded
+        and pointing_up
+        and not thumb_extended(lm)
+    )
+
+
+def is_thumb_down(lm):
+    palm = max(distance(lm[0], lm[9]), 1e-6)
+
+    thumb_open = (
+        distance(lm[4], lm[2]) / palm > 0.55
+    )
+
+    others_folded = all([
+        finger_folded(lm, 5, 6, 8),
+        finger_folded(lm, 9, 10, 12),
+        finger_folded(lm, 13, 14, 16),
+        finger_folded(lm, 17, 18, 20),
+    ])
+
+    pointing_down = points_direction(
+        lm,
+        2,
+        4,
+        180,
+        VOLUME_DOWN_TOLERANCE
+    )
+
+    return (
+        thumb_open
+        and others_folded
+        and pointing_down
+    )
+
+
+def recognize_gesture(lm, handedness):
+    if is_v_sign(lm):
+        return "V_SIGN"
+
+    if is_ok(lm):
+        return "PLAY_PAUSE"
+
+    if is_gun(lm, handedness):
+        if handedness == "Left":
+            return "SEEK_BACKWARD"
+
+        if handedness == "Right":
+            return "SEEK_FORWARD"
+
+    if is_index_up(lm):
+        return "VOLUME_UP"
+
+    if is_thumb_down(lm):
+        return "VOLUME_DOWN"
 
     return "UNKNOWN"
 
 
-class JamJamRecognizer:
-    """OPEN -> FIST -> OPEN 제스처 인식"""
-
-    def __init__(self, max_duration=1.5, cooldown=1.0):
-        self.max_duration = max_duration
+class GestureController:
+    def __init__(
+        self,
+        hold_time=1.0,
+        cooldown=0.8,
+        stable_time=0.15
+    ):
+        self.hold_time = hold_time
         self.cooldown = cooldown
+        self.stable_time = stable_time
 
-        self.state = "WAIT_OPEN"
-        self.start_time = 0.0
-        self.last_trigger = -float("inf")
-        self.previous_shape = "UNKNOWN"
+        self.enabled = False
+        self.current_gesture = "UNKNOWN"
+        self.gesture_start = time.monotonic()
 
-    def reset(self):
-        self.state = "WAIT_OPEN"
-        self.previous_shape = "UNKNOWN"
+        self.v_latched = False
+        self.command_latched = False
+        self.last_command_time = -float("inf")
 
-    def update(self, hand_shape):
+    def reset_tracking(self):
+        self.current_gesture = "UNKNOWN"
+        self.gesture_start = time.monotonic()
+        self.v_latched = False
+        self.command_latched = False
+
+    def update(self, gesture):
         now = time.monotonic()
 
-        if now - self.last_trigger < self.cooldown:
+        if gesture != self.current_gesture:
+            self.current_gesture = gesture
+            self.gesture_start = now
+            self.command_latched = False
+
+            if gesture != "V_SIGN":
+                self.v_latched = False
+
+        elapsed = now - self.gesture_start
+
+        if gesture == "V_SIGN":
+            if (
+                elapsed >= self.hold_time
+                and not self.v_latched
+            ):
+                self.enabled = not self.enabled
+                self.v_latched = True
+                self.last_command_time = now
+
+                return (
+                    "CONTROL_ON"
+                    if self.enabled
+                    else "CONTROL_OFF"
+                )
+
             return None
 
-        if self.state != "WAIT_OPEN":
-            if now - self.start_time > self.max_duration:
-                self.reset()
-
-        if hand_shape == self.previous_shape:
+        if not self.enabled:
             return None
 
-        self.previous_shape = hand_shape
+        if gesture == "UNKNOWN":
+            return None
 
-        if self.state == "WAIT_OPEN":
-            if hand_shape == "OPEN":
-                self.state = "WAIT_FIST"
-                self.start_time = now
+        if self.command_latched:
+            return None
 
-        elif self.state == "WAIT_FIST":
-            if hand_shape == "FIST":
-                self.state = "WAIT_FINAL_OPEN"
+        if elapsed < self.stable_time:
+            return None
 
-        elif self.state == "WAIT_FINAL_OPEN":
-            if hand_shape == "OPEN":
-                self.last_trigger = now
-                self.reset()
-                return "PLAY_PAUSE"
+        if (
+            now - self.last_command_time
+            < self.cooldown
+        ):
+            return None
 
-        return None
+        self.command_latched = True
+        self.last_command_time = now
+
+        return gesture
