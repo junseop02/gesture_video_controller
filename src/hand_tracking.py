@@ -8,8 +8,9 @@ import mediapipe as mp
 from gesture_recognition import (
     GestureController,
     recognize_gesture,
-    gun_diagnostics
+    select_gesture
 )
+from motion_tracking import MotionTracker
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -44,15 +45,10 @@ def draw_landmarks(frame, landmarks):
     for lm in landmarks:
         x = int(lm.x * width)
         y = int(lm.y * height)
-
         points.append((x, y))
 
         cv2.circle(
-            frame,
-            (x, y),
-            4,
-            (0, 0, 255),
-            -1
+            frame, (x, y), 4, (0, 0, 255), -1
         )
 
     for start, end in CONNECTIONS:
@@ -72,69 +68,27 @@ def get_handedness(result, index):
     ):
         return "UNKNOWN"
 
-    detected_hand = (
-        result.handedness[index][0].category_name
-    )
+    detected = result.handedness[index][0].category_name
 
-    # 기존 카메라 환경에 맞춘 좌우 보정 유지
-    if detected_hand == "Left":
+    if detected == "Left":
         return "Right"
 
-    if detected_hand == "Right":
+    if detected == "Right":
         return "Left"
 
     return "UNKNOWN"
 
 
-def status_text(value):
-    return "OK" if value else "NO"
-
-
-def draw_debug(frame, hand_name, info, row):
-    x = 15
-    y = 220 + row * 150
-
-    angle_value = info["index_angle"]
-
-    if angle_value is None:
-        angle_text = "N/A"
-    else:
-        angle_text = f"{angle_value:.1f}"
-
-    lines = [
-        f"{hand_name} GUN TEST",
-        (
-            f"Shape: {status_text(info['shape_ok'])}  "
-            f"Thumb: {status_text(info['thumb_ok'])}"
-        ),
-        (
-            f"Index: {status_text(info['index_ok'])}  "
-            f"Middle: {status_text(info['middle_ok'])}"
-        ),
-        (
-            f"Ring: {status_text(info['ring_ok'])}  "
-            f"Pinky: {status_text(info['pinky_ok'])}"
-        ),
-        (
-            f"Direction: {status_text(info['direction_ok'])} "
-            f"({angle_text} deg)"
-        ),
-        (
-            f"Palm: {status_text(info['palm_ok'])} "
-            f"({info['palm_score']:.2f})"
-        ),
-    ]
-
-    for j, line in enumerate(lines):
-        cv2.putText(
-            frame,
-            line,
-            (x, y + j * 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            2
-        )
+def draw_text(frame, text, x, y, color=(255, 255, 255)):
+    cv2.putText(
+        frame,
+        text,
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2
+    )
 
 
 def main():
@@ -147,6 +101,11 @@ def main():
     )
 
     controller = GestureController()
+
+    trackers = {
+        "Left": MotionTracker(),
+        "Right": MotionTracker()
+    }
 
     cap = cv2.VideoCapture(0)
 
@@ -181,12 +140,10 @@ def main():
                 timestamp_ms = int(
                     (time.monotonic() - start_time) * 1000
                 )
-
                 timestamp_ms = max(
                     timestamp_ms,
                     last_timestamp + 1
                 )
-
                 last_timestamp = timestamp_ms
 
                 result = detector.detect_for_video(
@@ -194,92 +151,109 @@ def main():
                     timestamp_ms
                 )
 
-                detected_gestures = []
+                hand_data = []
+                seen_hands = set()
 
                 if result.hand_landmarks:
-                    for i, hand in enumerate(
-                        result.hand_landmarks
-                    ):
+                    for i, hand in enumerate(result.hand_landmarks):
                         draw_landmarks(frame, hand)
 
-                        handedness = get_handedness(
-                            result,
-                            i
-                        )
+                        name = get_handedness(result, i)
+                        static = recognize_gesture(hand, name)
 
-                        gesture = recognize_gesture(
-                            hand,
-                            handedness
-                        )
+                        hand_data.append({
+                            "name": name,
+                            "landmarks": hand,
+                            "static": static
+                        })
 
-                        detected_gestures.append(
-                            (handedness, gesture)
-                        )
+                        if name in trackers:
+                            seen_hands.add(name)
 
-                        info = gun_diagnostics(
-                            hand,
-                            handedness
-                        )
+                static_gestures = [
+                    item["static"] for item in hand_data
+                ]
 
-                        draw_debug(
-                            frame,
-                            handedness,
-                            info,
-                            i
-                        )
+                high_priority_active = any(
+                    gesture in ("V_SIGN", "PLAY_PAUSE")
+                    for gesture in static_gestures
+                )
 
-                        height, width = frame.shape[:2]
-                        wrist = hand[0]
+                candidates = list(static_gestures)
+                motion_sources = {}
 
-                        text_x = int(wrist.x * width)
-                        text_y = int(wrist.y * height) + 25
+                for item in hand_data:
+                    name = item["name"]
 
-                        text_x = max(
-                            0,
-                            min(text_x, width - 220)
-                        )
+                    if name not in trackers:
+                        continue
 
-                        text_y = max(
-                            25,
-                            min(text_y, height - 10)
-                        )
+                    tracker = trackers[name]
 
-                        cv2.putText(
-                            frame,
-                            f"{handedness}: {gesture}",
-                            (text_x, text_y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            (255, 255, 0),
-                            2
-                        )
-
-                    gestures = [
-                        gesture
-                        for _, gesture in detected_gestures
-                    ]
-
-                    if "V_SIGN" in gestures:
-                        selected_gesture = "V_SIGN"
-
-                    else:
-                        # 첫 번째 손의 명령을 사용
-                        selected_gesture = gestures[0]
-
-                    command = controller.update(
-                        selected_gesture
+                    allow_motion = (
+                        controller.enabled
+                        and not high_priority_active
                     )
 
-                    if command is not None:
-                        last_command = command
-                        print(f"Command: {command}")
+                    # 손 모양에 관계없이 이동 방향만 검사
+                    motion = tracker.update(
+                        item["landmarks"],
+                        allow_motion=allow_motion
+                    )
 
-                else:
+                    if motion is not None:
+                        candidates.append(motion)
+                        motion_sources.setdefault(
+                            motion, []
+                        ).append(name)
+
+                    height, width = frame.shape[:2]
+                    wrist = item["landmarks"][0]
+
+                    x = int(wrist.x * width)
+                    y = int(wrist.y * height) + 25
+
+                    x = max(0, min(x, width - 230))
+                    y = max(25, min(y, height - 10))
+
+                    label = (
+                        motion
+                        if motion is not None
+                        else item["static"]
+                    )
+
+                    draw_text(
+                        frame,
+                        f"{name}: {label}",
+                        x, y,
+                        (255, 255, 0)
+                    )
+
+                for name, tracker in trackers.items():
+                    if name not in seen_hands:
+                        tracker.mark_missing()
+
+                selected = select_gesture(candidates)
+
+                if not hand_data:
                     controller.reset_tracking()
+                    command = None
+                else:
+                    command = controller.update(selected)
 
-                status = (
-                    "ON" if controller.enabled else "OFF"
-                )
+                if command is not None:
+                    last_command = command
+                    print(f"Command: {command}")
+
+                    if command in ("CONTROL_ON", "CONTROL_OFF"):
+                        for tracker in trackers.values():
+                            tracker.reset()
+
+                    elif command in motion_sources:
+                        for name in motion_sources[command]:
+                            trackers[name].lock()
+
+                status = "ON" if controller.enabled else "OFF"
 
                 status_color = (
                     (0, 255, 0)
@@ -287,50 +261,54 @@ def main():
                     else (0, 0, 255)
                 )
 
-                cv2.putText(
+                draw_text(
                     frame,
                     f"Control: {status}",
-                    (15, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    status_color,
-                    2
+                    15, 35,
+                    status_color
                 )
 
-                cv2.putText(
+                draw_text(
                     frame,
-                    f"Hands detected: {len(detected_gestures)}",
-                    (15, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 0),
-                    2
+                    f"Hands detected: {len(hand_data)}",
+                    15, 70,
+                    (255, 255, 0)
                 )
 
-                cv2.putText(
+                draw_text(
+                    frame,
+                    f"Selected: {selected}",
+                    15, 105,
+                    (255, 255, 0)
+                )
+
+                draw_text(
                     frame,
                     f"Last Command: {last_command}",
-                    (15, 115),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 0, 255),
-                    2
+                    15, 140,
+                    (255, 0, 255)
                 )
 
-                cv2.putText(
+                draw_text(
+                    frame,
+                    f"Left: {trackers['Left'].state}",
+                    15, 175
+                )
+
+                draw_text(
+                    frame,
+                    f"Right: {trackers['Right'].state}",
+                    15, 205
+                )
+
+                draw_text(
                     frame,
                     "ESC: EXIT",
-                    (15, frame.shape[0] - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2
+                    15,
+                    frame.shape[0] - 20
                 )
 
-                cv2.imshow(
-                    "Gesture Controller",
-                    frame
-                )
+                cv2.imshow("Gesture Controller", frame)
 
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
