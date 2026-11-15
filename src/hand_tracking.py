@@ -16,10 +16,12 @@ from gesture_recognition import (
     thumb_pose,
     thumb_info
 )
+from fullscreen_tracking import FullscreenTracker
 from swing_tracking import SwingTracker, SeekGate, trace  # 가운데->좌/우 스윙 SEEK + 3초/주먹 규칙
 
 # 볼륨 = 엄지 위(따봉) + 손 위로 이동 / 엄지 아래 + 손 아래로 이동. 끄려면 False.
 ENABLE_VOLUME = True
+DEBUG_FULLSCREEN = False  # 상태 전환을 터미널에 출력
 SEEK_COMMANDS = ("SEEK_FORWARD", "SEEK_BACKWARD")
 
 
@@ -137,6 +139,8 @@ def main():
     )
 
     controller = GestureController()
+    fullscreen_tracker = FullscreenTracker()
+    last_fs_state = None
 
     trackers = {
         name: SwingTracker(
@@ -235,13 +239,43 @@ def main():
                     for gesture in static_gestures
                 )
 
+                # V/OK는 기존 우선순위를 유지한다. 두 손은 화면 x좌표로
+                # 정렬하므로 handedness 라벨이 흔들려도 전체화면 추적은 유지된다.
+                pair = sorted(
+                    hand_data,
+                    key=lambda item: fullscreen_tracker.center(item["landmarks"])[0]
+                )
+                fs_left, fs_right = (
+                    (pair[0]["landmarks"], pair[1]["landmarks"])
+                    if len(pair) == 2 else (None, None)
+                )
+                fullscreen_command, fullscreen_active = fullscreen_tracker.update(
+                    fs_left, fs_right,
+                    enabled=controller.enabled and not high_priority_active
+                )
+                if fullscreen_active:
+                    # 누락된 손의 스윙 기록도 지워 복귀 시 이전 동작이 발화하지 않게 한다.
+                    for tracker in trackers.values():
+                        tracker.reset()
+                if DEBUG_FULLSCREEN and fullscreen_tracker.state != last_fs_state:
+                    print(
+                        f"[FS] {fullscreen_tracker.state} "
+                        f"distance={fullscreen_tracker.distance:.3f} "
+                        f"delta={fullscreen_tracker.delta:+.3f} "
+                        f"active={fullscreen_active}"
+                    )
+                    last_fs_state = fullscreen_tracker.state
+
                 candidates = list(static_gestures)
                 motion_sources = {}
 
                 # 주먹을 0.25초 쥐면: 방금 방향을 3초 막고 반대 방향을 푼다
                 # 방향 전환은 엄지까지 접은 진짜 주먹만 인정한다 (따봉/엄지 아래는 제외)
                 fist_visible = any(item["true_fist"] for item in hand_data)
-                if controller.enabled and gate.update_fist(fist_visible):
+                if gate.update_fist(
+                    fist_visible and controller.enabled
+                    and not high_priority_active and not fullscreen_active
+                ):
                     print(f"FIST: now only {gate.last_seek}")
                     trace("gate", "FIST", "", "", "", "", "", "", "", "", "", gate.last_seek)
                     command_log.append(
@@ -259,6 +293,7 @@ def main():
                     allow_motion = (
                         controller.enabled
                         and not high_priority_active
+                        and not fullscreen_active
                     )
 
                     # 손 모양에 관계없이 이동 방향만 검사
@@ -316,6 +351,13 @@ def main():
                 else:
                     command = controller.update(selected)
 
+                # Fullscreen 명령은 원본 select_gesture의 PRIORITY에 없으므로
+                # 직접 전달한다. 이 프레임의 일반 이동 후보는 위에서 차단된다.
+                if fullscreen_command is not None:
+                    command = fullscreen_command
+                    selected = fullscreen_command
+                    controller.last_command_time = time.monotonic()
+
                 if command is not None:
                     last_command = command
                     print(f"Command: {command}")
@@ -324,6 +366,8 @@ def main():
                     )
 
                     if command in ("CONTROL_ON", "CONTROL_OFF"):
+                        fullscreen_tracker.reset_motion()
+                        fullscreen_tracker.last_seen_time = None
                         for tracker in trackers.values():
                             tracker.reset()
 
@@ -382,6 +426,11 @@ def main():
                     15, 205
                 )
 
+                draw_text(frame, f"FS State: {fullscreen_tracker.state}", 15, 235)
+                draw_text(frame, f"FS Distance: {fullscreen_tracker.distance:.3f}", 15, 265)
+                draw_text(frame, f"FS Delta: {fullscreen_tracker.delta:+.3f}", 15, 295)
+                draw_text(frame, f"FS Active: {fullscreen_active}", 15, 325)
+
                 draw_text(
                     frame,
                     "ESC: EXIT",
@@ -422,3 +471,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
