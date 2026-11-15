@@ -10,13 +10,15 @@ class MotionTracker:
         vertical_threshold=0.15,
         window=0.6,
         cooldown=1.5,
-        direction_ratio=1.5
+        direction_ratio=1.5,
+        gap=0.2
     ):
         self.horizontal_threshold = horizontal_threshold
         self.vertical_threshold = vertical_threshold
         self.window = window
         self.cooldown = cooldown
         self.direction_ratio = direction_ratio
+        self.gap = gap  # 손을 이만큼(초) 넘게 놓치면 이동 기록을 버린다
 
         self.history = deque()
         self.state = "READY"
@@ -64,7 +66,7 @@ class MotionTracker:
 
         if (
             self.last_seen is not None
-            and now - self.last_seen > 0.2
+            and now - self.last_seen > self.gap
         ):
             self.clear_history()
 

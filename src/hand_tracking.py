@@ -1,5 +1,6 @@
 
 import time
+from collections import deque  # FPS 이동평균용
 from pathlib import Path
 
 import cv2
@@ -8,9 +9,18 @@ import mediapipe as mp
 from gesture_recognition import (
     GestureController,
     recognize_gesture,
-    select_gesture
+    select_gesture,
+    is_fist,
+    is_true_fist,
+    is_relaxed_open,
+    thumb_pose,
+    thumb_info
 )
-from motion_tracking import MotionTracker
+from swing_tracking import SwingTracker, SeekGate, trace  # 가운데->좌/우 스윙 SEEK + 3초/주먹 규칙
+
+# 볼륨 = 엄지 위(따봉) + 손 위로 이동 / 엄지 아래 + 손 아래로 이동. 끄려면 False.
+ENABLE_VOLUME = True
+SEEK_COMMANDS = ("SEEK_FORWARD", "SEEK_BACKWARD")
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -91,6 +101,32 @@ def draw_text(frame, text, x, y, color=(255, 255, 255)):
     )
 
 
+def draw_command_log(frame, command_log):
+    """최근 인식 명령을 우측 하단에 스택으로 표시. 최신이 맨 아래, 밝게."""
+    if not command_log:
+        return
+
+    height, width = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale, thick, line_h, pad = 0.55, 1, 24, 8
+
+    lines = [f"{t:.1f}s  {cmd}" for t, cmd in command_log]
+    box_w = max(cv2.getTextSize(s, font, scale, thick)[0][0] for s in lines) + pad * 2
+    box_h = line_h * len(lines) + pad
+    x0, y0 = width - box_w - 10, height - box_h - 10
+
+    # 반투명 검은 배경
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (width - 10, height - 10), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    for i, s in enumerate(lines):
+        newest = i == len(lines) - 1
+        color = (0, 255, 255) if newest else (180, 180, 180)  # 최신 = 노랑, 이전 = 회색
+        cv2.putText(frame, s, (x0 + pad, y0 + line_h * (i + 1)), font, scale, color,
+                    thick + (1 if newest else 0))
+
+
 def main():
     options = HandLandmarkerOptions(
         base_options=BaseOptions(
@@ -103,9 +139,14 @@ def main():
     controller = GestureController()
 
     trackers = {
-        "Left": MotionTracker(),
-        "Right": MotionTracker()
+        name: SwingTracker(
+            name=name,
+            cooldown=0.3,  # 원본 1.5초. 다시 가운데로 와야 준비되므로 짧게. 반대 방향은 SeekGate 가 3초 막음
+            vertical_threshold=0.15 if ENABLE_VOLUME else float("inf")
+        )
+        for name in ("Left", "Right")
     }
+    gate = SeekGate()  # 반대 방향 3초 / 주먹으로 전환 (두 손 공통)
 
     cap = cv2.VideoCapture(0)
 
@@ -115,10 +156,14 @@ def main():
     start_time = time.monotonic()
     last_timestamp = -1
     last_command = "NONE"
+    loop_times = deque(maxlen=30)  # 최근 30프레임 루프 시작 시각 (FPS 이동평균)
+    detect_ms = 0.0  # 직전 손 검출 소요 시간(ms)
+    command_log = deque(maxlen=5)  # 최근 인식 명령 5개 (우측 하단 로그 스택)
 
     try:
         with HandLandmarker.create_from_options(options) as detector:
             while True:
+                loop_times.append(time.perf_counter())  # 루프 1회 시작 시각 기록
                 ret, frame = cap.read()
 
                 if not ret:
@@ -146,10 +191,12 @@ def main():
                 )
                 last_timestamp = timestamp_ms
 
+                t_detect = time.perf_counter()  # 검출 시작
                 result = detector.detect_for_video(
                     mp_image,
                     timestamp_ms
                 )
+                detect_ms = (time.perf_counter() - t_detect) * 1000  # 검출 소요 ms
 
                 hand_data = []
                 seen_hands = set()
@@ -161,10 +208,19 @@ def main():
                         name = get_handedness(result, i)
                         static = recognize_gesture(hand, name)
 
+                        # 3D 랜드마크는 엄지 각도·돌출 거리에만 쓴다 (진짜 주먹 vs 엄지 자세 구분).
+                        # 네 손가락 접힘/편 손은 화면 좌표가 더 잘 잡혀서 그대로 둔다.
+                        world = result.hand_world_landmarks[i]
+
                         hand_data.append({
                             "name": name,
                             "landmarks": hand,
-                            "static": static
+                            "static": static,
+                            "thumb": thumb_pose(hand, world),  # "UP"/"DOWN"/None
+                            "fist": is_fist(hand),             # 네 손가락 접힘 (따봉도 포함)
+                            "true_fist": is_true_fist(hand, world),  # 엄지까지 접은 주먹
+                            "open": is_relaxed_open(hand),     # 편 손
+                            "info": thumb_info(hand, world)    # 진단 기록용
                         })
 
                         if name in trackers:
@@ -182,6 +238,16 @@ def main():
                 candidates = list(static_gestures)
                 motion_sources = {}
 
+                # 주먹을 0.25초 쥐면: 방금 방향을 3초 막고 반대 방향을 푼다
+                # 방향 전환은 엄지까지 접은 진짜 주먹만 인정한다 (따봉/엄지 아래는 제외)
+                fist_visible = any(item["true_fist"] for item in hand_data)
+                if controller.enabled and gate.update_fist(fist_visible):
+                    print(f"FIST: now only {gate.last_seek}")
+                    trace("gate", "FIST", "", "", "", "", "", "", "", "", "", gate.last_seek)
+                    command_log.append(
+                        (time.monotonic() - start_time, f"FIST > {gate.last_seek[5:]} only")
+                    )
+
                 for item in hand_data:
                     name = item["name"]
 
@@ -198,7 +264,13 @@ def main():
                     # 손 모양에 관계없이 이동 방향만 검사
                     motion = tracker.update(
                         item["landmarks"],
-                        allow_motion=allow_motion
+                        allow_motion=allow_motion,
+                        # 잠긴 방향은 판정기에서 아예 인식하지 않는다
+                        blocked=[c for c in SEEK_COMMANDS if not gate.allows(c)],
+                        thumb=item["thumb"] if ENABLE_VOLUME else None,
+                        fist=item["fist"],
+                        open_hand=item["open"],
+                        info=item["info"]
                     )
 
                     if motion is not None:
@@ -229,6 +301,9 @@ def main():
                         (255, 255, 0)
                     )
 
+                    if tracker.debug:  # 스윙 각도 변화 / 손목 이동 (값 조정용)
+                        draw_text(frame, tracker.debug, x, min(y + 25, height - 10), (0, 200, 255))
+
                 for name, tracker in trackers.items():
                     if name not in seen_hands:
                         tracker.mark_missing()
@@ -244,6 +319,9 @@ def main():
                 if command is not None:
                     last_command = command
                     print(f"Command: {command}")
+                    command_log.append(  # (시작 후 경과 초, 명령) 기록
+                        (time.monotonic() - start_time, command)
+                    )
 
                     if command in ("CONTROL_ON", "CONTROL_OFF"):
                         for tracker in trackers.values():
@@ -252,6 +330,9 @@ def main():
                     elif command in motion_sources:
                         for name in motion_sources[command]:
                             trackers[name].lock()
+
+                    if command in SEEK_COMMANDS:
+                        gate.on_seek(command)  # 반대 방향 3초 막기 시작
 
                 status = "ON" if controller.enabled else "OFF"
 
@@ -307,6 +388,27 @@ def main():
                     15,
                     frame.shape[0] - 20
                 )
+
+                # FPS = 최근 30프레임 루프 간격 평균 (오른쪽 위 표시)
+                if len(loop_times) >= 2:
+                    fps = (len(loop_times) - 1) / (loop_times[-1] - loop_times[0])
+                else:
+                    fps = 0.0
+                fw = frame.shape[1]  # 오른쪽 정렬용 프레임 너비
+                draw_text(frame, f"FPS: {fps:.1f}", fw - 170, 35, (0, 255, 255))  # FPS 표시
+                draw_text(frame, f"Detect: {detect_ms:.0f} ms", fw - 170, 70, (0, 255, 255))  # 검출 시간 표시
+
+                # SEEK 가능 여부 (막혀 있으면 남은 초)
+                for i, cmd in enumerate(SEEK_COMMANDS):
+                    left = gate.remaining(cmd)
+                    draw_text(
+                        frame,
+                        f"{cmd[5:]}: " + ("OK" if left == 0 else f"blocked {left:.1f}s"),
+                        fw - 250, 105 + 30 * i,
+                        (0, 255, 0) if left == 0 else (0, 0, 255)
+                    )
+
+                draw_command_log(frame, command_log)  # 우측 하단 명령 로그 (최신이 맨 아래)
 
                 cv2.imshow("Gesture Controller", frame)
 
